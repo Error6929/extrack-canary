@@ -1,0 +1,131 @@
+name: Preview Environment Bridge
+
+on:
+  pull_request:
+    branches:
+      - canary
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+concurrency:
+  group: preview-environment-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: read
+  statuses: read
+  deployments: write
+
+jobs:
+  wait_for_vercel_signals:
+    name: Wait for Vercel checks
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Wait for Vercel checks to complete
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = context.payload.pull_request.head.sha;
+            const pollIntervalMs = 15_000;
+            const timeoutMs = 15 * 60 * 1000;
+            const deadline = Date.now() + timeoutMs;
+
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const isVercelText = (value) => typeof value === "string" && value.toLowerCase().includes("vercel");
+
+            const successfulCheckConclusions = new Set(["success", "neutral", "skipped"]);
+            const failedCheckConclusions = new Set([
+              "failure",
+              "timed_out",
+              "cancelled",
+              "action_required",
+              "startup_failure",
+            ]);
+            const successfulStatusStates = new Set(["success"]);
+            const failedStatusStates = new Set(["failure", "error"]);
+
+            while (Date.now() < deadline) {
+              const checkRunsResponse = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref: headSha,
+                per_page: 100,
+              });
+              const statusResponse = await github.rest.repos.getCombinedStatusForRef({
+                owner,
+                repo,
+                ref: headSha,
+              });
+
+              const vercelCheckRuns = checkRunsResponse.data.check_runs.filter((checkRun) => {
+                return isVercelText(checkRun.name) || isVercelText(checkRun.app?.slug);
+              });
+
+              const vercelStatuses = statusResponse.data.statuses.filter((status) => {
+                return (
+                  isVercelText(status.context) ||
+                  isVercelText(status.creator?.login) ||
+                  isVercelText(status.description)
+                );
+              });
+
+              const hasVercelSignals = vercelCheckRuns.length > 0 || vercelStatuses.length > 0;
+              const hasFailedChecks = vercelCheckRuns.some((checkRun) => {
+                const { conclusion } = checkRun;
+                return conclusion ? failedCheckConclusions.has(conclusion) : false;
+              });
+              const hasFailedStatuses = vercelStatuses.some((status) => failedStatusStates.has(status.state));
+              const hasPendingChecks = vercelCheckRuns.some((checkRun) => {
+                return checkRun.status !== "completed" || !checkRun.conclusion;
+              });
+              const hasPendingStatuses = vercelStatuses.some((status) => status.state === "pending");
+
+              if (hasFailedChecks || hasFailedStatuses) {
+                core.setFailed("A Vercel check/status reported failure.");
+                return;
+              }
+
+              if (hasVercelSignals && !hasPendingChecks && !hasPendingStatuses) {
+                const allChecksSuccessful = vercelCheckRuns.every((checkRun) => {
+                  return checkRun.conclusion
+                    ? successfulCheckConclusions.has(checkRun.conclusion)
+                    : false;
+                });
+                const allStatusesSuccessful = vercelStatuses.every((status) => {
+                  return successfulStatusStates.has(status.state);
+                });
+
+                if (allChecksSuccessful && allStatusesSuccessful) {
+                  core.info(`Vercel checks complete for ${headSha}.`);
+                  return;
+                }
+
+                core.setFailed("Vercel checks completed without all-success states.");
+                return;
+              }
+
+              core.info("Waiting for Vercel checks/statuses...");
+              await sleep(pollIntervalMs);
+            }
+
+            core.setFailed("Timed out waiting for Vercel checks/statuses.");
+
+  publish_preview_environment_deployment:
+    name: Publish Preview environment deployment
+    needs: wait_for_vercel_signals
+    if: ${{ needs.wait_for_vercel_signals.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: Preview
+      url: ${{ github.event.pull_request.html_url }}
+    steps:
+      - name: Mark Preview deployment as successful
+        run: echo "Published Preview environment deployment for ${{ github.event.pull_request.head.sha }}"
